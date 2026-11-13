@@ -1,0 +1,543 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Battle Map</title>
+<style>
+    :root {
+        --bg: #000000;
+        --fg: #ffffff;
+        --pill: #000000aa;
+        --accent: #2f6fb0;
+    }
+    html, body {
+        margin: 0;
+        height: 100%;
+        background: var(--bg);
+        color: var(--fg);
+        overflow: hidden;
+        font-family: system-ui, sans-serif;
+    }
+    canvas {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+        touch-action: none;
+    }
+    #status {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        padding: 6px 12px;
+        border-radius: 999px;
+        background: var(--pill);
+        font-size: 14px;
+    }
+    #join {
+        position: fixed;
+        inset: 0;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        background: var(--bg);
+    }
+    #join form {
+        display: flex;
+        gap: 8px;
+        padding: 0 16px;
+    }
+    #join input, #join button {
+        font-size: 18px;
+        padding: 10px 14px;
+        border-radius: 8px;
+        border: 0;
+    }
+    #join button {
+        background: var(--accent);
+        color: var(--fg);
+    }
+</style>
+</head>
+<body>
+<canvas id="map"></canvas>
+<div id="status">Connecting</div>
+<div id="join">
+    <form id="join-form">
+        <input id="join-room" placeholder="Room code" autocomplete="off">
+        <button type="submit">Join</button>
+    </form>
+</div>
+<script>
+    const RELAY = "wss://vtt-relay.slopverse.workers.dev";
+    const NAME_SIZE = 28;
+    const PROP_COLORS = ["#6b4f8a", "#4f7a8a", "#8a5f4f", "#4f8a62", "#8a4f6b", "#7a7a4f"];
+
+    const canvas = document.getElementById("map");
+    const ctx = canvas.getContext("2d");
+    const statusEl = document.getElementById("status");
+    const room = new URLSearchParams(location.search).get("room");
+
+    ctx.imageSmoothingQuality = "high";
+
+    let state = null;
+    let textures = {};
+    let socket = null;
+    let retry = 0;
+    let pingTimer = null;
+    let view = { scale: 1, ox: 0, oy: 0 };
+    let drag = null;
+    let optimistic = null;
+
+    function setStatus(text) {
+        statusEl.textContent = text;
+    }
+
+    function hpColor(hp, max) {
+        if (hp >= max) {
+            return "#3fb950";
+        }
+        const pct = hp * 100 / max;
+        if (pct > 75) {
+            return "#9acd32";
+        }
+        if (pct > 50) {
+            return "#e6d229";
+        }
+        if (pct > 25) {
+            return "#f08c1e";
+        }
+        return "#d93a3a";
+    }
+
+    function hashColor(text) {
+        let sum = 0;
+        for (const ch of text) {
+            sum += ch.charCodeAt(0);
+        }
+        return PROP_COLORS[sum % PROP_COLORS.length];
+    }
+
+    function outlinedText(text, x, y, size, baseline) {
+        ctx.font = "bold " + size + "px system-ui, sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = baseline;
+        ctx.lineJoin = "round";
+        ctx.lineWidth = Math.max(2, size / 7);
+        ctx.strokeStyle = "#000000";
+        ctx.strokeText(text, x, y);
+        ctx.fillStyle = "#ffffff";
+        ctx.fillText(text, x, y);
+    }
+
+    function placed(tok) {
+        if (drag && drag.id === tok.id) {
+            return Object.assign({}, tok, { cx: drag.x, cy: drag.y });
+        }
+        if (optimistic && optimistic.id === tok.id && Date.now() < optimistic.expires) {
+            return Object.assign({}, tok, { cx: optimistic.cx, cy: optimistic.cy });
+        }
+        return tok;
+    }
+
+    function variant(tex, mode) {
+        if (!tex[mode]) {
+            const layer = document.createElement("canvas");
+            layer.width = tex.img.naturalWidth;
+            layer.height = tex.img.naturalHeight;
+            const g = layer.getContext("2d");
+            g.drawImage(tex.img, 0, 0);
+            if (mode === "dim") {
+                g.globalCompositeOperation = "source-atop";
+                g.fillStyle = "rgba(0, 0, 0, 0.5)";
+                g.fillRect(0, 0, layer.width, layer.height);
+            } else {
+                g.globalCompositeOperation = "saturation";
+                g.fillStyle = "#808080";
+                g.fillRect(0, 0, layer.width, layer.height);
+                g.globalCompositeOperation = "destination-in";
+                g.drawImage(tex.img, 0, 0);
+            }
+            tex[mode] = layer;
+        }
+        return tex[mode];
+    }
+
+    function paintCell(key, x, y, size, mode) {
+        const tex = textures[key];
+        if (tex) {
+            ctx.drawImage(mode === "full" ? tex.img : variant(tex, mode), x, y, size, size);
+            return;
+        }
+        ctx.fillStyle = key.charAt(0) === "#" ? key : (state.colors || {})[key] || "#2b2b2b";
+        ctx.fillRect(x, y, size, size);
+        if (mode === "dim") {
+            ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
+            ctx.fillRect(x, y, size, size);
+        }
+    }
+
+    function shape(flat) {
+        const path = new Path2D();
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+        for (let i = 0; i < flat.length; i += 2) {
+            if (i === 0) {
+                path.moveTo(flat[i], flat[i + 1]);
+            } else {
+                path.lineTo(flat[i], flat[i + 1]);
+            }
+            minX = Math.min(minX, flat[i]);
+            maxX = Math.max(maxX, flat[i]);
+            minY = Math.min(minY, flat[i + 1]);
+            maxY = Math.max(maxY, flat[i + 1]);
+        }
+        path.closePath();
+        return { path: path, minX: minX, minY: minY, maxX: maxX, maxY: maxY };
+    }
+
+    function prepareFog(data) {
+        if (!data.fog) {
+            return;
+        }
+        data.fog.darks = data.fog.darks.map(shape);
+        data.fog.lights = data.fog.lights.map((light) => ({ p: shape(light.p), b: light.b ? shape(light.b) : null, dim: light.dim, bright: light.bright }));
+    }
+
+    function paintIn(sh, paint) {
+        const tile = state.tile;
+        const c0 = Math.max(0, Math.floor(sh.minX / tile));
+        const c1 = Math.min(state.cols - 1, Math.floor(sh.maxX / tile));
+        const r0 = Math.max(0, Math.floor(sh.minY / tile));
+        const r1 = Math.min(state.rows - 1, Math.floor(sh.maxY / tile));
+        ctx.save();
+        ctx.clip(sh.path);
+        for (let row = r0; row <= r1; row++) {
+            for (let col = c0; col <= c1; col++) {
+                paint(col, row);
+            }
+        }
+        ctx.restore();
+    }
+
+    function drawFog(size) {
+        const tile = state.tile;
+        ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
+        ctx.fillRect(0, 0, state.cols * tile, state.rows * tile);
+        for (const sh of state.fog.darks) {
+            paintIn(sh, (col, row) => {
+                paintCell(state.tiles[row][col], col * tile, row * tile, size, "gray");
+                ctx.fillStyle = "rgba(255, 255, 255, 0.133)";
+                ctx.fillRect(col * tile, row * tile, size, size);
+            });
+        }
+        for (const light of state.fog.lights) {
+            paintIn(light.p, (col, row) => {
+                paintCell(state.tiles[row][col], col * tile, row * tile, size, "full");
+            });
+        }
+        const tint = (col, row) => {
+            ctx.fillStyle = "rgba(255, 216, 58, 0.102)";
+            ctx.fillRect(col * tile, row * tile, size, size);
+        };
+        for (const light of state.fog.lights) {
+            if (light.dim) {
+                paintIn(light.p, tint);
+            }
+            if (light.bright) {
+                paintIn(light.b || light.p, tint);
+            }
+        }
+    }
+
+    function drawProp(prop) {
+        const tex = textures[prop.key];
+        if (tex) {
+            const image = prop.mode && prop.mode !== "full" ? variant(tex, prop.mode) : tex.img;
+            if (tex.fw) {
+                const pz = Math.min(prop.w / tex.fw, prop.h / tex.fh);
+                const dw = tex.tw * pz;
+                const dh = tex.th * pz;
+                ctx.drawImage(image, prop.cx - dw / 2, prop.cy - dh / 2, dw, dh);
+            } else {
+                ctx.drawImage(image, prop.cx - prop.w / 2, prop.cy - prop.h / 2, prop.w, prop.h);
+            }
+            return;
+        }
+        const x = prop.cx - prop.w / 2;
+        const y = prop.cy - prop.h / 2;
+        ctx.fillStyle = hashColor(prop.key);
+        ctx.strokeStyle = "#000000aa";
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.roundRect(x, y, prop.w, prop.h, Math.min(prop.w, prop.h) * 0.15);
+        ctx.fill();
+        ctx.stroke();
+        outlinedText(prop.key.replace("prop_", "").replace(/_\d+$/, ""), prop.cx, prop.cy, 20, "middle");
+    }
+
+    function drawToken(tok) {
+        const r = tok.size / 2;
+        const border = tok.size * 0.045;
+        ctx.globalAlpha = tok.alpha === undefined ? 1 : tok.alpha;
+
+        ctx.beginPath();
+        ctx.arc(tok.cx, tok.cy, r, 0, Math.PI * 2);
+        ctx.fillStyle = tok.fill;
+        ctx.fill();
+
+        const portrait = tok.img ? textures[tok.img] : null;
+        if (portrait) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.arc(tok.cx, tok.cy, r, 0, Math.PI * 2);
+            ctx.clip();
+            ctx.drawImage(portrait.img, tok.cx - r, tok.cy - r, tok.size, tok.size);
+            ctx.restore();
+        }
+
+        ctx.beginPath();
+        ctx.arc(tok.cx, tok.cy, r - border / 2, 0, Math.PI * 2);
+        ctx.lineWidth = border;
+        ctx.strokeStyle = tok.color;
+        ctx.stroke();
+
+        if (!portrait) {
+            outlinedText(tok.initial, tok.cx, tok.cy, tok.size * 0.55, "middle");
+        }
+
+        if (tok.name) {
+            outlinedText(tok.name, tok.cx, tok.cy - r - 4, NAME_SIZE, "bottom");
+        }
+
+        if (tok.hp !== undefined) {
+            const bh = Math.max(8, Math.floor(tok.size / 4));
+            const bx = tok.cx - r;
+            const by = tok.cy + r - bh;
+            ctx.fillStyle = "#000000cc";
+            ctx.fillRect(bx, by, tok.size, bh);
+            const w = tok.size * Math.max(0, Math.min(1, tok.hp / tok.max_hp));
+            if (w > 0) {
+                ctx.fillStyle = hpColor(tok.hp, tok.max_hp);
+                ctx.fillRect(bx, by, w, bh);
+            }
+            if (bh >= 16) {
+                outlinedText(tok.hp + "/" + tok.max_hp, tok.cx, by + bh / 2, bh - 6, "middle");
+            }
+        }
+        ctx.globalAlpha = 1;
+    }
+
+    function draw() {
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.fillStyle = "#000000";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        if (!state) {
+            return;
+        }
+
+        const tile = state.tile;
+        const size = tile - state.gap;
+        const mapW = state.cols * tile;
+        const mapH = state.rows * tile;
+        const scale = Math.min(canvas.width / mapW, canvas.height / mapH);
+        view = { scale: scale, ox: (canvas.width - mapW * scale) / 2, oy: (canvas.height - mapH * scale) / 2 };
+        ctx.setTransform(view.scale, 0, 0, view.scale, view.ox, view.oy);
+
+        for (let row = 0; row < state.rows; row++) {
+            for (let col = 0; col < state.cols; col++) {
+                paintCell(state.tiles[row][col], col * tile, row * tile, size, "full");
+            }
+        }
+
+        if (state.fog) {
+            drawFog(size);
+        }
+
+        for (const [col, row, key, shade] of state.walls) {
+            paintCell(key, col * tile, row * tile, size, state.fog ? ["dim", "full", "gray"][shade] : "full");
+        }
+
+        for (const prop of state.props) {
+            ctx.globalAlpha = prop.alpha === undefined ? 1 : prop.alpha;
+            drawProp(prop);
+        }
+        ctx.globalAlpha = 1;
+
+        let held = null;
+        for (const tok of state.tokens) {
+            if (drag && drag.id === tok.id) {
+                held = placed(tok);
+            } else {
+                drawToken(placed(tok));
+            }
+        }
+        if (held) {
+            drawToken(held);
+        }
+    }
+
+    function toMap(event) {
+        const rect = canvas.getBoundingClientRect();
+        const dpr = canvas.width / rect.width;
+        return {
+            x: ((event.clientX - rect.left) * dpr - view.ox) / view.scale,
+            y: ((event.clientY - rect.top) * dpr - view.oy) / view.scale,
+        };
+    }
+
+    function tokenAt(point) {
+        if (!state) {
+            return null;
+        }
+        for (let i = state.tokens.length - 1; i >= 0; i--) {
+            const tok = state.tokens[i];
+            const shown = placed(tok);
+            const half = tok.size / 2;
+            if (tok.player && Math.abs(point.x - shown.cx) <= half && Math.abs(point.y - shown.cy) <= half) {
+                return tok;
+            }
+        }
+        return null;
+    }
+
+    function snap(tok, point) {
+        const tile = state.tile;
+        const n = Math.max(1, Math.floor(tok.cells || 1));
+        const col = Math.max(0, Math.min(state.cols - n, Math.floor((point.x - (n - 1) * tile / 2) / tile)));
+        const row = Math.max(0, Math.min(state.rows - n, Math.floor((point.y - (n - 1) * tile / 2) / tile)));
+        const off = tok.size < tile - state.gap ? (tile - state.gap - tok.size) / 2 : 0;
+        return { col: col, row: row, cx: col * tile + off + tok.size / 2, cy: row * tile + off + tok.size / 2 };
+    }
+
+    function finishDrag() {
+        if (!drag) {
+            return;
+        }
+        const tok = state ? state.tokens.find((t) => t.id === drag.id) : null;
+        const target = tok ? snap(tok, drag) : null;
+        drag = null;
+        canvas.style.cursor = "default";
+        if (target && (Math.abs(target.cx - tok.cx) >= 1 || Math.abs(target.cy - tok.cy) >= 1) && socket && socket.readyState === 1) {
+            socket.send(JSON.stringify({ type: "move", id: tok.id, col: target.col, row: target.row }));
+            optimistic = { id: tok.id, cx: target.cx, cy: target.cy, expires: Date.now() + 2000 };
+            setTimeout(draw, 2100);
+        }
+        draw();
+    }
+
+    canvas.addEventListener("pointerdown", (event) => {
+        const point = toMap(event);
+        const tok = tokenAt(point);
+        if (!tok) {
+            return;
+        }
+        canvas.setPointerCapture(event.pointerId);
+        drag = { id: tok.id, x: point.x, y: point.y };
+        optimistic = null;
+        canvas.style.cursor = "grabbing";
+        draw();
+    });
+
+    canvas.addEventListener("pointermove", (event) => {
+        const point = toMap(event);
+        if (drag) {
+            drag.x = Math.max(0, Math.min(state.cols * state.tile, point.x));
+            drag.y = Math.max(0, Math.min(state.rows * state.tile, point.y));
+            draw();
+        } else {
+            canvas.style.cursor = tokenAt(point) ? "grab" : "default";
+        }
+    });
+
+    canvas.addEventListener("pointerup", finishDrag);
+
+    canvas.addEventListener("pointercancel", () => {
+        drag = null;
+        canvas.style.cursor = "default";
+        draw();
+    });
+
+    function resize() {
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = Math.floor(innerWidth * dpr);
+        canvas.height = Math.floor(innerHeight * dpr);
+        draw();
+    }
+
+    function connect() {
+        socket = new WebSocket(RELAY + "/ws/" + encodeURIComponent(room) + "?role=player");
+
+        socket.onopen = () => {
+            retry = 0;
+            setStatus(state ? "Live" : "Waiting for the DM");
+            pingTimer = setInterval(() => {
+                if (socket.readyState === 1) {
+                    socket.send("ping");
+                }
+            }, 25000);
+        };
+
+        socket.onmessage = (event) => {
+            if (event.data === "pong") {
+                return;
+            }
+            let data;
+            try {
+                data = JSON.parse(event.data);
+            } catch (error) {
+                return;
+            }
+            if (data.type === "tex") {
+                const img = new Image();
+                img.onload = () => {
+                    textures[data.key] = { img: img, fw: data.fw, fh: data.fh, tw: data.tw, th: data.th };
+                    draw();
+                };
+                img.src = "data:image/png;base64," + data.png;
+                return;
+            }
+            if (data.type === "state") {
+                prepareFog(data);
+                state = data;
+                if (optimistic) {
+                    const t = data.tokens.find((x) => x.id === optimistic.id);
+                    if (!t || (Math.abs(t.cx - optimistic.cx) < 1 && Math.abs(t.cy - optimistic.cy) < 1)) {
+                        optimistic = null;
+                    }
+                }
+                setStatus("Live");
+                draw();
+            }
+        };
+
+        socket.onclose = () => {
+            clearInterval(pingTimer);
+            setStatus("Reconnecting");
+            retry = Math.min(retry + 1, 6);
+            setTimeout(connect, 500 * Math.pow(2, retry));
+        };
+    }
+
+    window.addEventListener("resize", resize);
+    resize();
+
+    if (room) {
+        connect();
+    } else {
+        statusEl.style.display = "none";
+        document.getElementById("join").style.display = "flex";
+        document.getElementById("join-form").onsubmit = (event) => {
+            event.preventDefault();
+            const code = document.getElementById("join-room").value.trim();
+            if (code) {
+                location.search = "?room=" + encodeURIComponent(code);
+            }
+        };
+    }
+</script>
+</body>
+</html>
