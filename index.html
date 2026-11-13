@@ -34,6 +34,17 @@
         background: var(--pill);
         font-size: 14px;
     }
+    #fit {
+        position: fixed;
+        top: 12px;
+        right: 12px;
+        padding: 8px 14px;
+        border: 0;
+        border-radius: 999px;
+        background: var(--pill);
+        color: var(--fg);
+        font-size: 14px;
+    }
     #join {
         position: fixed;
         inset: 0;
@@ -62,6 +73,7 @@
 <body>
 <canvas id="map"></canvas>
 <div id="status">Connecting</div>
+<button id="fit" type="button">Fit</button>
 <div id="join">
     <form id="join-form">
         <input id="join-room" placeholder="Room code" autocomplete="off">
@@ -71,6 +83,8 @@
 <script>
     const RELAY = "wss://vtt-relay.slopverse.workers.dev";
     const NAME_SIZE = 28;
+    const MIN_ZOOM = 1;
+    const MAX_ZOOM = 6;
     const PROP_COLORS = ["#6b4f8a", "#4f7a8a", "#8a5f4f", "#4f8a62", "#8a4f6b", "#7a7a4f"];
 
     const canvas = document.getElementById("map");
@@ -86,7 +100,11 @@
     let retry = 0;
     let pingTimer = null;
     let view = { scale: 1, ox: 0, oy: 0 };
+    let cam = { zoom: 1, px: 0, py: 0 };
     let drag = null;
+    let pan = null;
+    let pinch = null;
+    const pointers = new Map();
     let optimistic = null;
 
     function setStatus(text) {
@@ -330,6 +348,34 @@
         ctx.globalAlpha = 1;
     }
 
+    function fitScale() {
+        return Math.min(canvas.width / (state.cols * state.tile), canvas.height / (state.rows * state.tile));
+    }
+
+    function updateView() {
+        const mapW = state.cols * state.tile;
+        const mapH = state.rows * state.tile;
+        const scale = fitScale() * cam.zoom;
+        const limX = Math.max(0, (mapW * scale - canvas.width) / 2);
+        const limY = Math.max(0, (mapH * scale - canvas.height) / 2);
+        cam.px = Math.max(-limX, Math.min(limX, cam.px));
+        cam.py = Math.max(-limY, Math.min(limY, cam.py));
+        view = { scale: scale, ox: (canvas.width - mapW * scale) / 2 + cam.px, oy: (canvas.height - mapH * scale) / 2 + cam.py };
+    }
+
+    function zoomAt(x, y, zoom) {
+        if (!state) {
+            return;
+        }
+        const next = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom));
+        const mx = (x - view.ox) / view.scale;
+        const my = (y - view.oy) / view.scale;
+        const scale = fitScale() * next;
+        cam.zoom = next;
+        cam.px = x - mx * scale - (canvas.width - state.cols * state.tile * scale) / 2;
+        cam.py = y - my * scale - (canvas.height - state.rows * state.tile * scale) / 2;
+    }
+
     function draw() {
         ctx.setTransform(1, 0, 0, 1, 0, 0);
         ctx.fillStyle = "#000000";
@@ -341,10 +387,7 @@
 
         const tile = state.tile;
         const size = tile - state.gap;
-        const mapW = state.cols * tile;
-        const mapH = state.rows * tile;
-        const scale = Math.min(canvas.width / mapW, canvas.height / mapH);
-        view = { scale: scale, ox: (canvas.width - mapW * scale) / 2, oy: (canvas.height - mapH * scale) / 2 };
+        updateView();
         ctx.setTransform(view.scale, 0, 0, view.scale, view.ox, view.oy);
 
         for (let row = 0; row < state.rows; row++) {
@@ -380,6 +423,17 @@
         }
     }
 
+    function toCanvas(event) {
+        const rect = canvas.getBoundingClientRect();
+        const dpr = canvas.width / rect.width;
+        return { x: (event.clientX - rect.left) * dpr, y: (event.clientY - rect.top) * dpr };
+    }
+
+    function spread() {
+        const [a, b] = Array.from(pointers.values());
+        return { dist: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)), x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    }
+
     function toMap(event) {
         const rect = canvas.getBoundingClientRect();
         const dpr = canvas.width / rect.width;
@@ -413,6 +467,17 @@
         return { col: col, row: row, cx: col * tile + off + tok.size / 2, cy: row * tile + off + tok.size / 2 };
     }
 
+    function release(event) {
+        if (!pointers.delete(event.pointerId)) {
+            return;
+        }
+        pinch = null;
+        pan = null;
+        if (pointers.size === 1 && !drag) {
+            pan = pointers.keys().next().value;
+        }
+    }
+
     function finishDrag() {
         if (!drag) {
             return;
@@ -430,12 +495,25 @@
     }
 
     canvas.addEventListener("pointerdown", (event) => {
+        if (pointers.size >= 2) {
+            return;
+        }
+        pointers.set(event.pointerId, toCanvas(event));
+        canvas.setPointerCapture(event.pointerId);
+        if (pointers.size === 2) {
+            drag = null;
+            pan = null;
+            pinch = spread();
+            canvas.style.cursor = "default";
+            draw();
+            return;
+        }
         const point = toMap(event);
         const tok = tokenAt(point);
         if (!tok) {
+            pan = event.pointerId;
             return;
         }
-        canvas.setPointerCapture(event.pointerId);
         drag = { id: tok.id, x: point.x, y: point.y };
         optimistic = null;
         canvas.style.cursor = "grabbing";
@@ -443,6 +521,26 @@
     });
 
     canvas.addEventListener("pointermove", (event) => {
+        const prev = pointers.get(event.pointerId);
+        if (prev) {
+            const now = toCanvas(event);
+            pointers.set(event.pointerId, now);
+            if (pinch && pointers.size === 2) {
+                const next = spread();
+                zoomAt(pinch.x, pinch.y, cam.zoom * next.dist / pinch.dist);
+                cam.px += next.x - pinch.x;
+                cam.py += next.y - pinch.y;
+                pinch = next;
+                draw();
+                return;
+            }
+            if (pan === event.pointerId) {
+                cam.px += now.x - prev.x;
+                cam.py += now.y - prev.y;
+                draw();
+                return;
+            }
+        }
         const point = toMap(event);
         if (drag) {
             drag.x = Math.max(0, Math.min(state.cols * state.tile, point.x));
@@ -453,13 +551,30 @@
         }
     });
 
-    canvas.addEventListener("pointerup", finishDrag);
+    canvas.addEventListener("pointerup", (event) => {
+        release(event);
+        finishDrag();
+    });
 
-    canvas.addEventListener("pointercancel", () => {
+    canvas.addEventListener("pointercancel", (event) => {
+        release(event);
         drag = null;
         canvas.style.cursor = "default";
         draw();
     });
+
+    canvas.addEventListener("wheel", (event) => {
+        event.preventDefault();
+        const point = toCanvas(event);
+        const delta = event.deltaMode === 1 ? event.deltaY * 33 : event.deltaY;
+        zoomAt(point.x, point.y, cam.zoom * Math.exp(-delta * (event.ctrlKey ? 0.01 : 0.0015)));
+        draw();
+    }, { passive: false });
+
+    document.getElementById("fit").onclick = () => {
+        cam = { zoom: 1, px: 0, py: 0 };
+        draw();
+    };
 
     function resize() {
         const dpr = window.devicePixelRatio || 1;
