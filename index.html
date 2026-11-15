@@ -45,6 +45,18 @@
         color: var(--fg);
         font-size: 14px;
     }
+    #who {
+        position: fixed;
+        bottom: 12px;
+        left: 12px;
+        padding: 6px 12px;
+        border: 0;
+        border-radius: 999px;
+        background: var(--pill);
+        color: var(--fg);
+        font-size: 14px;
+        display: none;
+    }
     #join {
         position: fixed;
         inset: 0;
@@ -74,9 +86,10 @@
 <canvas id="map"></canvas>
 <div id="status">Connecting</div>
 <button id="fit" type="button">Fit</button>
+<button id="who" type="button"></button>
 <div id="join">
     <form id="join-form">
-        <input id="join-room" placeholder="Room code" autocomplete="off">
+        <input id="join-name" placeholder="Your token name" autocomplete="off">
         <button type="submit">Join</button>
     </form>
 </div>
@@ -90,7 +103,66 @@
     const canvas = document.getElementById("map");
     const ctx = canvas.getContext("2d");
     const statusEl = document.getElementById("status");
-    const room = new URLSearchParams(location.search).get("room");
+    const DEFAULT_ROOM = "slopverse-test";
+    const params = new URLSearchParams(location.search);
+    const room = params.get("room") || DEFAULT_ROOM;
+    const joinEl = document.getElementById("join");
+    const nameInput = document.getElementById("join-name");
+    const whoEl = document.getElementById("who");
+    let myName = "";
+
+    function loadName() {
+        const fromUrl = (params.get("name") || "").trim();
+        if (fromUrl) {
+            return fromUrl;
+        }
+        try {
+            return (localStorage.getItem("tokenName") || "").trim();
+        } catch (error) {
+            return "";
+        }
+    }
+
+    function saveName(name) {
+        try {
+            localStorage.setItem("tokenName", name);
+        } catch (error) {
+        }
+    }
+
+    function myIds() {
+        const ids = new Set();
+        if (state) {
+            for (const tok of state.tokens) {
+                if (tok.player && sameName(tok.name)) {
+                    ids.add(tok.id);
+                }
+            }
+        }
+        return ids;
+    }
+
+    function seenBy(list, mine) {
+        return !!list && list.some((id) => mine.has(id));
+    }
+
+    function shownAlpha(entry, mine) {
+        if (seenBy(entry.rv, mine)) {
+            return 1;
+        }
+        return entry.alpha === undefined ? 1 : entry.alpha;
+    }
+
+    function sameName(name) {
+        return !!myName && (name || "").trim().toLowerCase() === myName.toLowerCase();
+    }
+
+    function setName(name) {
+        myName = name;
+        whoEl.textContent = "Playing as " + name;
+        whoEl.style.display = "block";
+        joinEl.style.display = "none";
+    }
 
     ctx.imageSmoothingQuality = "high";
 
@@ -220,7 +292,7 @@
         if (!data.fog) {
             return;
         }
-        data.fog.darks = data.fog.darks.map(shape);
+        data.fog.darks = data.fog.darks.map((dark) => ({ o: dark.o, sh: shape(dark.p) }));
         data.fog.lights = data.fog.lights.map((light) => ({ p: shape(light.p), b: light.b ? shape(light.b) : null, dim: light.dim, bright: light.bright }));
     }
 
@@ -240,12 +312,15 @@
         ctx.restore();
     }
 
-    function drawFog(size) {
+    function drawFog(size, mine) {
         const tile = state.tile;
         ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
         ctx.fillRect(0, 0, state.cols * tile, state.rows * tile);
-        for (const sh of state.fog.darks) {
-            paintIn(sh, (col, row) => {
+        for (const dark of state.fog.darks) {
+            if (!mine.has(dark.o)) {
+                continue;
+            }
+            paintIn(dark.sh, (col, row) => {
                 paintCell(state.tiles[row][col], col * tile, row * tile, size, "gray");
                 ctx.fillStyle = "rgba(255, 255, 255, 0.133)";
                 ctx.fillRect(col * tile, row * tile, size, size);
@@ -387,6 +462,7 @@
 
         const tile = state.tile;
         const size = tile - state.gap;
+        const mine = myIds();
         updateView();
         ctx.setTransform(view.scale, 0, 0, view.scale, view.ox, view.oy);
 
@@ -397,25 +473,35 @@
         }
 
         if (state.fog) {
-            drawFog(size);
+            drawFog(size, mine);
         }
 
-        for (const [col, row, key, shade] of state.walls) {
-            paintCell(key, col * tile, row * tile, size, state.fog ? ["dim", "full", "gray"][shade] : "full");
+        for (const [col, row, key, shade, owners] of state.walls) {
+            const level = shade === 2 && !seenBy(owners, mine) ? 0 : shade;
+            paintCell(key, col * tile, row * tile, size, state.fog ? ["dim", "full", "gray"][level] : "full");
         }
 
         for (const prop of state.props) {
-            ctx.globalAlpha = prop.alpha === undefined ? 1 : prop.alpha;
-            drawProp(prop);
+            const alpha = shownAlpha(prop, mine);
+            if (alpha <= 0) {
+                continue;
+            }
+            ctx.globalAlpha = alpha;
+            drawProp(seenBy(prop.dk, mine) ? Object.assign({}, prop, { mode: "gray" }) : prop);
         }
         ctx.globalAlpha = 1;
 
         let held = null;
         for (const tok of state.tokens) {
+            const alpha = shownAlpha(tok, mine);
+            if (alpha <= 0) {
+                continue;
+            }
+            const shown = Object.assign({}, placed(tok), { alpha: alpha });
             if (drag && drag.id === tok.id) {
-                held = placed(tok);
+                held = shown;
             } else {
-                drawToken(placed(tok));
+                drawToken(shown);
             }
         }
         if (held) {
@@ -451,7 +537,7 @@
             const tok = state.tokens[i];
             const shown = placed(tok);
             const half = tok.size / 2;
-            if (tok.player && Math.abs(point.x - shown.cx) <= half && Math.abs(point.y - shown.cy) <= half) {
+            if (tok.player && sameName(tok.name) && Math.abs(point.x - shown.cx) <= half && Math.abs(point.y - shown.cy) <= half) {
                 return tok;
             }
         }
@@ -640,18 +726,30 @@
     window.addEventListener("resize", resize);
     resize();
 
-    if (room) {
-        connect();
+    connect();
+
+    document.getElementById("join-form").onsubmit = (event) => {
+        event.preventDefault();
+        const name = nameInput.value.trim();
+        if (name) {
+            saveName(name);
+            setName(name);
+            draw();
+        }
+    };
+
+    whoEl.onclick = () => {
+        nameInput.value = myName;
+        joinEl.style.display = "flex";
+        nameInput.focus();
+    };
+
+    const startName = loadName();
+
+    if (startName) {
+        setName(startName);
     } else {
-        statusEl.style.display = "none";
-        document.getElementById("join").style.display = "flex";
-        document.getElementById("join-form").onsubmit = (event) => {
-            event.preventDefault();
-            const code = document.getElementById("join-room").value.trim();
-            if (code) {
-                location.search = "?room=" + encodeURIComponent(code);
-            }
-        };
+        joinEl.style.display = "flex";
     }
 </script>
 </body>
