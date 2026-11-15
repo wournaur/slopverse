@@ -359,6 +359,9 @@
             });
         }
         for (const devil of state.fog.devils) {
+            if (!mine.has(devil.o)) {
+                continue;
+            }
             paintIn(devil.sh, (col, row) => {
                 paintCell(state.tiles[row][col], col * tile, row * tile, size, "full");
             });
@@ -514,7 +517,7 @@
         }
 
         for (const [col, row, key, shade, owners] of state.walls) {
-            const level = shade === 2 && !seenBy(owners, mine) ? 0 : shade;
+            const level = shade === 3 ? (seenBy(owners, mine) ? 1 : 0) : (shade === 2 && !seenBy(owners, mine) ? 0 : shade);
             paintCell(key, col * tile, row * tile, size, state.fog ? ["dim", "full", "gray"][level] : "full");
         }
 
@@ -531,7 +534,7 @@
                     alpha *= OVERLAY_FADE;
                 }
                 ctx.globalAlpha = alpha;
-                drawProp(seenBy(prop.dk, mine) ? Object.assign({}, prop, { mode: "gray" }) : prop);
+                drawProp(seenBy(prop.dv, mine) ? Object.assign({}, prop, { mode: "full" }) : (seenBy(prop.dk, mine) ? Object.assign({}, prop, { mode: "gray" }) : prop));
             }
             ctx.globalAlpha = 1;
         }
