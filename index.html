@@ -96,6 +96,9 @@
 <script>
     const RELAY = "wss://vtt-relay.slopverse.workers.dev";
     const NAME_SIZE = 28;
+    const OVERLAY_FADE = 0.75;
+    const RULER_THICK = 10;
+    const RULER_TEXT = 28;
     const MIN_ZOOM = 1;
     const MAX_ZOOM = 6;
     const PROP_COLORS = ["#6b4f8a", "#4f7a8a", "#8a5f4f", "#4f8a62", "#8a4f6b", "#7a7a4f"];
@@ -220,6 +223,34 @@
         ctx.fillText(text, x, y);
     }
 
+    function drawRuler(ruler) {
+        ctx.globalAlpha = 1;
+        let mx = (ruler.x1 + ruler.x2) / 2;
+        let my = (ruler.y1 + ruler.y2) / 2;
+        let lift = 0;
+        if (ruler.k === "sphere") {
+            const radius = Math.hypot(ruler.x2 - ruler.x1, ruler.y2 - ruler.y1);
+            ctx.fillStyle = ruler.c + "80";
+            ctx.beginPath();
+            ctx.arc(ruler.x1, ruler.y1, radius, 0, Math.PI * 2);
+            ctx.fill();
+            mx = ruler.x1;
+            my = ruler.y1;
+            lift = 12 / view.scale;
+        } else {
+            const length = Math.hypot(ruler.x2 - ruler.x1, ruler.y2 - ruler.y1);
+            if (length > 0) {
+                ctx.save();
+                ctx.translate(mx, my);
+                ctx.rotate(Math.atan2(ruler.y2 - ruler.y1, ruler.x2 - ruler.x1));
+                ctx.fillStyle = ruler.c;
+                ctx.fillRect(-length / 2, -RULER_THICK / 2, length, RULER_THICK);
+                ctx.restore();
+            }
+        }
+        outlinedText(ruler.ft + " ft", mx, my - lift, RULER_TEXT, "middle");
+    }
+
     function placed(tok) {
         if (drag && drag.id === tok.id) {
             return Object.assign({}, tok, { cx: drag.x, cy: drag.y });
@@ -293,6 +324,7 @@
             return;
         }
         data.fog.darks = data.fog.darks.map((dark) => ({ o: dark.o, sh: shape(dark.p) }));
+        data.fog.devils = (data.fog.devils || []).map((devil) => ({ o: devil.o, sh: shape(devil.p) }));
         data.fog.lights = data.fog.lights.map((light) => ({ p: shape(light.p), b: light.b ? shape(light.b) : null, dim: light.dim, bright: light.bright }));
     }
 
@@ -324,6 +356,11 @@
                 paintCell(state.tiles[row][col], col * tile, row * tile, size, "gray");
                 ctx.fillStyle = "rgba(255, 255, 255, 0.133)";
                 ctx.fillRect(col * tile, row * tile, size, size);
+            });
+        }
+        for (const devil of state.fog.devils) {
+            paintIn(devil.sh, (col, row) => {
+                paintCell(state.tiles[row][col], col * tile, row * tile, size, "full");
             });
         }
         for (const light of state.fog.lights) {
@@ -417,7 +454,7 @@
                 ctx.fillRect(bx, by, w, bh);
             }
             if (bh >= 16) {
-                outlinedText(tok.hp + "/" + tok.max_hp, tok.cx, by + bh / 2, bh - 6, "middle");
+                outlinedText(tok.hp_text || tok.hp + "/" + tok.max_hp, tok.cx, by + bh / 2, bh - 6, "middle");
             }
         }
         ctx.globalAlpha = 1;
@@ -481,32 +518,88 @@
             paintCell(key, col * tile, row * tile, size, state.fog ? ["dim", "full", "gray"][level] : "full");
         }
 
-        for (const prop of state.props) {
-            const alpha = shownAlpha(prop, mine);
-            if (alpha <= 0) {
-                continue;
+        function drawProps(overlay, tokenRects) {
+            for (const prop of state.props) {
+                if (!!prop.overlay !== overlay) {
+                    continue;
+                }
+                let alpha = shownAlpha(prop, mine);
+                if (alpha <= 0) {
+                    continue;
+                }
+                if (overlay && tokenRects.some((t) => t.x < prop.cx + prop.w / 2 && prop.cx - prop.w / 2 < t.x + t.size && t.y < prop.cy + prop.h / 2 && prop.cy - prop.h / 2 < t.y + t.size)) {
+                    alpha *= OVERLAY_FADE;
+                }
+                ctx.globalAlpha = alpha;
+                drawProp(seenBy(prop.dk, mine) ? Object.assign({}, prop, { mode: "gray" }) : prop);
             }
-            ctx.globalAlpha = alpha;
-            drawProp(seenBy(prop.dk, mine) ? Object.assign({}, prop, { mode: "gray" }) : prop);
+            ctx.globalAlpha = 1;
         }
-        ctx.globalAlpha = 1;
+
+        drawProps(false, []);
+        const tokenRects = [];
 
         let held = null;
-        for (const tok of state.tokens) {
+        const rulers = state.rulers || [];
+        let nextRuler = 0;
+        for (let i = 0; i < state.tokens.length; i++) {
+            const tok = state.tokens[i];
+            while (nextRuler < rulers.length && rulers[nextRuler].at <= i) {
+                drawRuler(rulers[nextRuler++]);
+            }
             const alpha = shownAlpha(tok, mine);
             if (alpha <= 0) {
                 continue;
             }
             const shown = Object.assign({}, placed(tok), { alpha: alpha });
+            tokenRects.push({ x: shown.cx - shown.size / 2, y: shown.cy - shown.size / 2, size: shown.size });
             if (drag && drag.id === tok.id) {
                 held = shown;
             } else {
                 drawToken(shown);
             }
         }
+        while (nextRuler < rulers.length) {
+            drawRuler(rulers[nextRuler++]);
+        }
         if (held) {
             drawToken(held);
         }
+        drawProps(true, tokenRects);
+
+        if (state.fog) {
+            blackout(mine);
+        }
+    }
+
+    let blackCanvas = null;
+
+    function blackout(mine) {
+        const own = state.fog.devils.filter((devil) => mine.has(devil.o));
+        if (!own.length) {
+            return;
+        }
+        if (!blackCanvas) {
+            blackCanvas = document.createElement("canvas");
+        }
+        if (blackCanvas.width !== canvas.width || blackCanvas.height !== canvas.height) {
+            blackCanvas.width = canvas.width;
+            blackCanvas.height = canvas.height;
+        }
+        const bctx = blackCanvas.getContext("2d");
+        bctx.setTransform(1, 0, 0, 1, 0, 0);
+        bctx.globalCompositeOperation = "source-over";
+        bctx.fillStyle = "#000000";
+        bctx.fillRect(0, 0, blackCanvas.width, blackCanvas.height);
+        bctx.setTransform(view.scale, 0, 0, view.scale, view.ox, view.oy);
+        bctx.globalCompositeOperation = "destination-out";
+        bctx.fillStyle = "#000000";
+        for (const devil of own) {
+            bctx.fill(devil.sh.path);
+        }
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.drawImage(blackCanvas, 0, 0);
+        ctx.setTransform(view.scale, 0, 0, view.scale, view.ox, view.oy);
     }
 
     function toCanvas(event) {
@@ -549,6 +642,13 @@
         const n = Math.max(1, Math.floor(tok.cells || 1));
         const col = Math.max(0, Math.min(state.cols - n, Math.floor((point.x - (n - 1) * tile / 2) / tile)));
         const row = Math.max(0, Math.min(state.rows - n, Math.floor((point.y - (n - 1) * tile / 2) / tile)));
+        const slots = tok.slots || 1;
+        if (slots > 1) {
+            const area = tile - state.gap;
+            const sx = Math.max(0, Math.min(slots - 1, Math.floor((point.x - col * tile) / area * slots)));
+            const sy = Math.max(0, Math.min(slots - 1, Math.floor((point.y - row * tile) / area * slots)));
+            return { col: col, row: row, sx: sx, sy: sy, cx: col * tile + (sx + 0.5) * area / slots, cy: row * tile + (sy + 0.5) * area / slots };
+        }
         const off = tok.size < tile - state.gap ? (tile - state.gap - tok.size) / 2 : 0;
         return { col: col, row: row, cx: col * tile + off + tok.size / 2, cy: row * tile + off + tok.size / 2 };
     }
@@ -573,7 +673,12 @@
         drag = null;
         canvas.style.cursor = "default";
         if (target && (Math.abs(target.cx - tok.cx) >= 1 || Math.abs(target.cy - tok.cy) >= 1) && socket && socket.readyState === 1) {
-            socket.send(JSON.stringify({ type: "move", id: tok.id, col: target.col, row: target.row }));
+            const move = { type: "move", id: tok.id, col: target.col, row: target.row };
+            if (target.sx !== undefined) {
+                move.sx = target.sx;
+                move.sy = target.sy;
+            }
+            socket.send(JSON.stringify(move));
             optimistic = { id: tok.id, cx: target.cx, cy: target.cy, expires: Date.now() + 2000 };
             setTimeout(draw, 2100);
         }
